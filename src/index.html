@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Perfect Tap</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; user-select: none; -webkit-user-select: none; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0e1a; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", system-ui, sans-serif; color: #fff; }
+  canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+  .ui { position: fixed; top: 0; left: 0; right: 0; bottom: 0; pointer-events: none; display: flex; flex-direction: column; }
+  .top { padding: env(safe-area-inset-top, 20px) 20px 0; display: flex; justify-content: space-between; align-items: flex-start; }
+  .score { font-size: 64px; font-weight: 800; letter-spacing: -2px; text-shadow: 0 2px 20px rgba(0,200,255,0.5); }
+  .best { font-size: 14px; opacity: 0.6; text-align: right; padding-top: 12px; }
+  .combo { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 120px; font-weight: 900; opacity: 0; pointer-events: none; }
+  .feedback { position: absolute; top: 35%; left: 50%; transform: translateX(-50%); font-size: 48px; font-weight: 800; opacity: 0; pointer-events: none; letter-spacing: -1px; }
+  .menu { position: fixed; inset: 0; display: flex; flex-direction: column; justify-content: center; align-items: center; background: rgba(10,14,26,0.95); pointer-events: all; transition: opacity 0.3s; z-index: 10; }
+  .menu.hidden { opacity: 0; pointer-events: none; }
+  .title { font-size: 56px; font-weight: 900; letter-spacing: -2px; margin-bottom: 8px; background: linear-gradient(180deg, #fff 0%, #00d4ff 100%); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+  .tagline { font-size: 16px; opacity: 0.6; margin-bottom: 60px; }
+  .play-btn { padding: 20px 60px; background: #00d4ff; color: #0a0e1a; border: none; border-radius: 100px; font-size: 20px; font-weight: 800; cursor: pointer; pointer-events: all; box-shadow: 0 10px 40px rgba(0,212,255,0.4); transition: transform 0.1s; }
+  .play-btn:active { transform: scale(0.95); }
+  .gameover-best { font-size: 18px; opacity: 0.6; margin-top: 20px; }
+  .hint { position: absolute; bottom: 15%; left: 0; right: 0; text-align: center; font-size: 16px; opacity: 0.5; pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div class="ui">
+  <div class="top">
+    <div class="score" id="score">0</div>
+    <div class="best">BEST<br><span id="best">0</span></div>
+  </div>
+  <div class="feedback" id="feedback"></div>
+  <div class="combo" id="combo"></div>
+  <div class="hint" id="hint">Tap when the bar hits the zone</div>
+</div>
+<div class="menu" id="menu">
+  <div class="title">PERFECT TAP</div>
+  <div class="tagline">How long can you stay in the zone?</div>
+  <button class="play-btn" id="playBtn">TAP TO START</button>
+  <div class="gameover-best" id="menuBest"></div>
+</div>
+
+<script>
+(() => {
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const scoreEl = document.getElementById('score');
+  const bestEl = document.getElementById('best');
+  const feedbackEl = document.getElementById('feedback');
+  const comboEl = document.getElementById('combo');
+  const menu = document.getElementById('menu');
+  const menuBest = document.getElementById('menuBest');
+  const playBtn = document.getElementById('playBtn');
+  const hint = document.getElementById('hint');
+
+  let W, H, DPR;
+  function resize() {
+    DPR = window.devicePixelRatio || 1;
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W * DPR;
+    canvas.height = H * DPR;
+    canvas.style.width = W + 'px';
+    canvas.style.height = H + 'px';
+    ctx.scale(DPR, DPR);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ----- Config (tune all gameplay here) -----
+  const CFG = {
+    barY: () => H * 0.62,
+    barWidth: () => Math.min(W * 0.85, 360),
+    barHeight: 14,
+    indicatorSize: 28,
+    zoneWidth: () => 0.18,        // fraction of bar that's "good"
+    perfectWidth: () => 0.06,     // fraction of bar that's "perfect"
+    startSpeed: 0.7,              // cycles per second
+    speedRamp: 0.05,              // added per perfect tap
+    maxSpeed: 3.0,
+    perfectPts: 10,
+    goodPts: 3,
+    missPts: 0,
+  };
+
+  // ----- State -----
+  const state = {
+    playing: false,
+    score: 0,
+    best: parseInt(localStorage.getItem('pt_best') || '0', 10),
+    combo: 0,
+    speed: CFG.startSpeed,
+    phase: 0,                     // 0..1 position along bar (ping-pong)
+    dir: 1,
+    zoneCenter: 0.5,
+    particles: [],
+    shake: 0,
+    flashColor: null,
+    flashAlpha: 0,
+    lastTime: 0,
+  };
+
+  bestEl.textContent = state.best;
+  menuBest.textContent = state.best > 0 ? `BEST: ${state.best}` : '';
+
+  // ----- Audio (no files needed — Web Audio synth) -----
+  let audioCtx;
+  function beep(freq, duration, type = 'sine', vol = 0.2) {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + duration);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + duration);
+  }
+  function haptic(ms = 10) {
+    if (navigator.vibrate) navigator.vibrate(ms);
+  }
+
+  // ----- Game flow -----
+  function startGame() {
+    state.playing = true;
+    state.score = 0;
+    state.combo = 0;
+    state.speed = CFG.startSpeed;
+    state.phase = 0;
+    state.dir = 1;
+    state.zoneCenter = 0.4 + Math.random() * 0.2;
+    state.particles = [];
+    state.shake = 0;
+    state.lastTime = performance.now();
+    scoreEl.textContent = '0';
+    menu.classList.add('hidden');
+    hint.style.opacity = 0.5;
+    setTimeout(() => { hint.style.opacity = 0; }, 2500);
+  }
+
+  function endGame() {
+    state.playing = false;
+    if (state.score > state.best) {
+      state.best = state.score;
+      localStorage.setItem('pt_best', String(state.best));
+      bestEl.textContent = state.best;
+      menuBest.innerHTML = `<span style="color:#00d4ff">NEW BEST: ${state.best}</span>`;
+    } else {
+      menuBest.textContent = `BEST: ${state.best}  |  THIS RUN: ${state.score}`;
+    }
+    playBtn.textContent = 'PLAY AGAIN';
+    menu.classList.remove('hidden');
+  }
+
+  function flashFeedback(text, color) {
+    feedbackEl.textContent = text;
+    feedbackEl.style.color = color;
+    feedbackEl.style.opacity = 1;
+    feedbackEl.style.transform = 'translateX(-50%) translateY(0) scale(1)';
+    feedbackEl.style.transition = 'none';
+    requestAnimationFrame(() => {
+      feedbackEl.style.transition = 'all 0.6s ease-out';
+      feedbackEl.style.opacity = 0;
+      feedbackEl.style.transform = 'translateX(-50%) translateY(-40px) scale(1.2)';
+    });
+  }
+
+  function showCombo(n) {
+    comboEl.textContent = 'x' + n;
+    comboEl.style.color = n >= 10 ? '#ffd700' : n >= 5 ? '#ff6ec7' : '#00d4ff';
+    comboEl.style.opacity = 0.3;
+    comboEl.style.transform = 'translate(-50%, -50%) scale(1.5)';
+    comboEl.style.transition = 'none';
+    requestAnimationFrame(() => {
+      comboEl.style.transition = 'all 0.4s ease-out';
+      comboEl.style.opacity = 0;
+      comboEl.style.transform = 'translate(-50%, -50%) scale(2)';
+    });
+  }
+
+  function burst(x, y, color, count = 20) {
+    for (let i = 0; i < count; i++) {
+      const angle = (Math.PI * 2 * i) / count + Math.random() * 0.3;
+      const speed = 3 + Math.random() * 4;
+      state.particles.push({
+        x, y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        life: 1,
+        color,
+        size: 3 + Math.random() * 3,
+      });
+    }
+  }
+
+  function onTap() {
+    if (!state.playing) return;
+    const dist = Math.abs(state.phase - state.zoneCenter);
+    const perfect = CFG.perfectWidth() / 2;
+    const good = CFG.zoneWidth() / 2;
+    const barLeft = (W - CFG.barWidth()) / 2;
+    const indicatorX = barLeft + state.phase * CFG.barWidth();
+    const indicatorY = CFG.barY();
+
+    if (dist <= perfect) {
+      state.score += CFG.perfectPts + state.combo;
+      state.combo++;
+      state.speed = Math.min(CFG.maxSpeed, state.speed + CFG.speedRamp);
+      state.flashColor = '#00d4ff';
+      state.flashAlpha = 0.3;
+      burst(indicatorX, indicatorY, '#00d4ff', 24);
+      flashFeedback('PERFECT', '#00d4ff');
+      beep(880, 0.15, 'triangle', 0.2);
+      beep(1320, 0.1, 'triangle', 0.15);
+      haptic(15);
+      if (state.combo > 1) showCombo(state.combo);
+    } else if (dist <= good) {
+      state.score += CFG.goodPts;
+      state.combo = 0;
+      state.flashColor = '#7eff7e';
+      state.flashAlpha = 0.15;
+      burst(indicatorX, indicatorY, '#7eff7e', 12);
+      flashFeedback('GOOD', '#7eff7e');
+      beep(660, 0.1, 'sine', 0.15);
+      haptic(8);
+    } else {
+      state.flashColor = '#ff3b6b';
+      state.flashAlpha = 0.4;
+      state.shake = 12;
+      burst(indicatorX, indicatorY, '#ff3b6b', 16);
+      flashFeedback('MISS', '#ff3b6b');
+      beep(180, 0.3, 'sawtooth', 0.2);
+      haptic(50);
+      setTimeout(endGame, 350);
+      return;
+    }
+
+    state.zoneCenter = 0.15 + Math.random() * 0.7;
+    scoreEl.textContent = state.score;
+  }
+
+  canvas.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    onTap();
+  });
+
+  playBtn.addEventListener('click', () => {
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+    startGame();
+  });
+
+  // ----- Render loop -----
+  function tick(now) {
+    const dt = Math.min(0.05, (now - state.lastTime) / 1000);
+    state.lastTime = now;
+
+    if (state.playing) {
+      state.phase += state.dir * state.speed * dt;
+      if (state.phase >= 1) { state.phase = 1; state.dir = -1; }
+      if (state.phase <= 0) { state.phase = 0; state.dir = 1; }
+    }
+
+    state.particles = state.particles.filter(p => {
+      p.x += p.vx;
+      p.y += p.vy;
+      p.vy += 0.15;
+      p.vx *= 0.96;
+      p.life -= 0.02;
+      return p.life > 0;
+    });
+
+    if (state.shake > 0) state.shake = Math.max(0, state.shake - 1);
+    if (state.flashAlpha > 0) state.flashAlpha = Math.max(0, state.flashAlpha - 0.02);
+
+    draw();
+    requestAnimationFrame(tick);
+  }
+
+  function draw() {
+    ctx.clearRect(0, 0, W, H);
+
+    // background gradient
+    const bg = ctx.createRadialGradient(W/2, H*0.4, 0, W/2, H*0.4, Math.max(W,H));
+    bg.addColorStop(0, '#1a2438');
+    bg.addColorStop(1, '#0a0e1a');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, W, H);
+
+    // screen shake
+    const sx = state.shake ? (Math.random() - 0.5) * state.shake : 0;
+    const sy = state.shake ? (Math.random() - 0.5) * state.shake : 0;
+    ctx.save();
+    ctx.translate(sx, sy);
+
+    const barW = CFG.barWidth();
+    const barH = CFG.barHeight;
+    const barX = (W - barW) / 2;
+    const barY = CFG.barY();
+    const zw = CFG.zoneWidth() * barW;
+    const pw = CFG.perfectWidth() * barW;
+    const zoneX = barX + state.zoneCenter * barW - zw / 2;
+    const perfectX = barX + state.zoneCenter * barW - pw / 2;
+
+    // bar background
+    ctx.fillStyle = 'rgba(255,255,255,0.08)';
+    roundRect(ctx, barX, barY - barH/2, barW, barH, barH/2);
+    ctx.fill();
+
+    // good zone
+    ctx.fillStyle = 'rgba(126,255,126,0.35)';
+    roundRect(ctx, zoneX, barY - barH/2, zw, barH, barH/2);
+    ctx.fill();
+
+    // perfect zone
+    ctx.fillStyle = 'rgba(0,212,255,0.8)';
+    ctx.shadowColor = '#00d4ff';
+    ctx.shadowBlur = 20;
+    roundRect(ctx, perfectX, barY - barH/2, pw, barH, barH/2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // indicator
+    const indX = barX + state.phase * barW;
+    ctx.fillStyle = '#fff';
+    ctx.shadowColor = '#fff';
+    ctx.shadowBlur = 15;
+    ctx.beginPath();
+    ctx.arc(indX, barY, CFG.indicatorSize / 2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // particles
+    state.particles.forEach(p => {
+      ctx.globalAlpha = p.life;
+      ctx.fillStyle = p.color;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+      ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+
+    ctx.restore();
+
+    // flash overlay
+    if (state.flashAlpha > 0) {
+      ctx.fillStyle = state.flashColor;
+      ctx.globalAlpha = state.flashAlpha;
+      ctx.fillRect(0, 0, W, H);
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  function roundRect(ctx, x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>

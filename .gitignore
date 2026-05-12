@@ -1,0 +1,31 @@
+# Node / Capacitor (added on Day 1 Block 1)
+node_modules/
+package-lock.json
+yarn.lock
+
+# Generated native projects
+ios/App/Pods/
+android/app/build/
+android/.gradle/
+android/build/
+android/local.properties
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code local config
+.claude/
+
+# Local builds
+dist/
+build/
+
+# Secrets (just in case)
+.env
+.env.local
+*.keystore
+*.jks
